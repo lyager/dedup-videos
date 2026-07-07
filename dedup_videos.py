@@ -11,6 +11,10 @@ Usage:
 
     # Execute - actually move duplicates to Trash
     uv run dedup_videos.py "/path/to/videos" --execute
+
+Analysis results are cached in .dedup_videos_cache.json inside the scanned
+directory, so a re-run (e.g. --execute after a dry-run) only analyzes new or
+changed files. Use --no-cache to force a full re-analysis.
 """
 
 import argparse
@@ -49,6 +53,14 @@ HASH_THRESHOLD = 6
 
 # Number of frames to sample from each video
 NUM_SAMPLE_FRAMES = 5
+
+# Scan cache: stored inside the scanned directory, keyed by path relative to it
+CACHE_FILENAME = ".dedup_videos_cache.json"
+CACHE_VERSION = 1  # bump when frame positions or entry schema change
+CACHE_SAVE_INTERVAL = 20  # newly analyzed files between autosaves
+
+# Sentinel returned by ScanCache.lookup for a cached analysis failure
+CACHE_FAILED = object()
 
 
 @dataclass
@@ -105,6 +117,148 @@ class VideoInfo:
             return "480p"
         else:
             return f"{self.height}p"
+
+
+class ScanCache:
+    """
+    Persistent cache of per-file analysis results.
+
+    Lives as a JSON file inside the scanned directory, keyed by path relative
+    to it, so results survive between runs (e.g. a dry-run followed by
+    --execute) and volume remounts under a different name. Entries are
+    validated against file size (exact) and mtime (second granularity, since
+    sync tools may restore mtimes with reduced precision).
+    """
+
+    def __init__(self, root: Path, enabled: bool = True, retry_failed: bool = False):
+        self.root = root
+        self.enabled = enabled
+        self.retry_failed = retry_failed
+        self.entries: dict[str, dict] = {}
+        self.hits = 0
+        self._dirty = 0
+        if not enabled:
+            return
+        cache_path = root / CACHE_FILENAME
+        if not cache_path.exists():
+            return
+        try:
+            with open(cache_path) as f:
+                data = json.load(f)
+            if (
+                data.get("version") != CACHE_VERSION
+                or data.get("hash_algo") != "phash"
+                or data.get("num_frames") != NUM_SAMPLE_FRAMES
+                or not isinstance(data.get("entries"), dict)
+            ):
+                print("Scan cache format changed - re-analyzing all files.")
+                return
+            self.entries = data["entries"]
+        except (OSError, json.JSONDecodeError):
+            print("Scan cache unreadable - re-analyzing all files.")
+
+    def _key(self, video_path: Path) -> str:
+        return video_path.relative_to(self.root).as_posix()
+
+    def lookup(self, video_path: Path) -> "VideoInfo | None | object":
+        """
+        Return the cached result for a file, or None on a cache miss.
+        A cached analysis failure is returned as the CACHE_FAILED sentinel
+        (unless retry_failed is set, which turns it into a miss).
+        """
+        if not self.enabled:
+            return None
+        entry = self.entries.get(self._key(video_path))
+        if entry is None:
+            return None
+        try:
+            st = video_path.stat()
+        except OSError:
+            return None
+        if (
+            entry.get("size") != st.st_size
+            or entry.get("mtime_ns", 0) // 1_000_000_000
+            != st.st_mtime_ns // 1_000_000_000
+        ):
+            return None
+        if entry.get("failed"):
+            if self.retry_failed:
+                return None
+            self.hits += 1
+            return CACHE_FAILED
+        try:
+            frame_hashes = [imagehash.hex_to_hash(h) for h in entry["frame_hashes"]]
+            info = VideoInfo(
+                path=video_path,
+                size_bytes=st.st_size,
+                duration=float(entry["duration"]),
+                width=int(entry["width"]),
+                height=int(entry["height"]),
+                bitrate=int(entry["bitrate"]),
+                frame_hashes=frame_hashes,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not frame_hashes:
+            return None
+        self.hits += 1
+        return info
+
+    def store(self, video_path: Path, info: "VideoInfo | None") -> None:
+        """Record an analysis result (info=None records a failure)."""
+        if not self.enabled:
+            return
+        try:
+            st = video_path.stat()
+        except OSError:
+            return
+        entry = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "failed": info is None}
+        if info is not None:
+            entry.update(
+                duration=info.duration,
+                width=info.width,
+                height=info.height,
+                bitrate=info.bitrate,
+                frame_hashes=[str(h) for h in info.frame_hashes],
+            )
+        self.entries[self._key(video_path)] = entry
+        self._dirty += 1
+        if self._dirty >= CACHE_SAVE_INTERVAL:
+            self.save()
+
+    def prune(self, existing_paths: list[Path]) -> None:
+        """Drop entries for files no longer on disk (e.g. trashed by --execute)."""
+        keys = {self._key(p) for p in existing_paths}
+        stale = [k for k in self.entries if k not in keys]
+        for k in stale:
+            del self.entries[k]
+        if stale:
+            self._dirty += 1
+
+    def save(self, force: bool = False) -> None:
+        """Atomically write the cache to disk if there are unsaved changes."""
+        if not self.enabled or (self._dirty == 0 and not force):
+            return
+        data = {
+            "version": CACHE_VERSION,
+            "hash_algo": "phash",
+            "num_frames": NUM_SAMPLE_FRAMES,
+            "entries": self.entries,
+        }
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(dir=self.root, prefix=CACHE_FILENAME + ".")
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, self.root / CACHE_FILENAME)
+            self._dirty = 0
+        except OSError as e:
+            print(f"  Warning: Could not save scan cache: {e}")
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
 
 def find_videos(directory: Path) -> list[Path]:
@@ -439,6 +593,10 @@ Examples:
   %(prog)s "/path/to/videos"              # Dry-run (default)
   %(prog)s "/path/to/videos" --execute    # Actually move duplicates to Trash
   %(prog)s "/path/to/videos" --threshold 8  # Use looser matching threshold
+  %(prog)s "/path/to/videos" --no-cache     # Ignore cached scan results
+
+Analysis results are cached in .dedup_videos_cache.json inside the scanned
+directory; re-runs only analyze new or changed files.
         """,
     )
     parser.add_argument(
@@ -460,6 +618,16 @@ Examples:
         type=int,
         default=HASH_THRESHOLD,
         help=f"Hash similarity threshold (default: {HASH_THRESHOLD}, lower=stricter)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Ignore the scan cache and re-analyze every file (cache is neither read nor written)",
+    )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Re-attempt files whose previous analysis failed (successful cache entries are still used)",
     )
 
     args = parser.parse_args()
@@ -484,20 +652,45 @@ Examples:
 
     print(f"Found {len(video_paths)} video files\n")
 
+    cache = ScanCache(
+        directory, enabled=not args.no_cache, retry_failed=args.retry_failed
+    )
+
     # Analyze each video
     videos = []
     failed = []
+    analyzed_count = 0
 
-    for i, video_path in enumerate(video_paths, 1):
-        print_progress(i, len(video_paths), video_path.name)
+    try:
+        for i, video_path in enumerate(video_paths, 1):
+            print_progress(i, len(video_paths), video_path.name)
 
-        video_info = analyze_video(video_path)
-        if video_info:
-            videos.append(video_info)
-        else:
-            failed.append(video_path)
+            cached = cache.lookup(video_path)
+            if cached is CACHE_FAILED:
+                failed.append(video_path)
+                continue
+            if cached is not None:
+                videos.append(cached)
+                continue
+
+            video_info = analyze_video(video_path)
+            analyzed_count += 1
+            cache.store(video_path, video_info)
+            if video_info:
+                videos.append(video_info)
+            else:
+                failed.append(video_path)
+    except KeyboardInterrupt:
+        cache.save(force=True)
+        print("\n\nInterrupted - scan progress saved to cache.")
+        sys.exit(130)
+
+    cache.prune(video_paths)
+    cache.save(force=True)
 
     print()  # New line after progress bar
+    if not args.no_cache:
+        print(f"{cache.hits} loaded from cache, {analyzed_count} analyzed")
     print()
 
     if failed:

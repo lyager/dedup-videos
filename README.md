@@ -8,6 +8,7 @@ Find and remove duplicate videos using perceptual hashing. Keeps the highest qua
 - **Quality-aware** - Keeps the best version based on: Resolution > Bitrate > Filesize
 - **Safe by default** - Dry-run mode shows what would be deleted without making changes
 - **macOS Trash** - Moves files to Trash (recoverable) instead of permanent deletion
+- **Scan cache** - Analysis results are cached, so re-runs (e.g. `--execute` after a dry-run) only analyze new or changed files
 
 ## Requirements
 
@@ -78,3 +79,14 @@ Files to delete:
 | `--execute` | Actually move duplicates to Trash |
 | `--verbose`, `-v` | Show detailed output with groups |
 | `--threshold N` | Hash similarity threshold (default: 6) |
+| `--no-cache` | Ignore the scan cache and re-analyze every file |
+| `--retry-failed` | Re-attempt files whose previous analysis failed |
+
+## Scan Cache
+
+Per-file analysis results (metadata + frame hashes) are stored in `.dedup_videos_cache.json` inside the scanned directory. On re-runs, files whose size and modification time are unchanged are loaded from the cache instead of being re-analyzed, so a `--execute` run after a dry-run is nearly instant.
+
+- The cache is per scanned directory: scanning a parent folder and a subfolder uses separate caches
+- Changed, new, or moved files are re-analyzed automatically; entries for deleted files are pruned
+- Failed analyses are also cached so broken files aren't retried every run — use `--retry-failed` to re-attempt them
+- Interrupting a scan (Ctrl-C) saves progress, and the next run resumes where it left off

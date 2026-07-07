@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Scan cache (created in the scanned directory)
+.dedup_videos_cache.json
